@@ -29,7 +29,7 @@ from .config import Config
 from .context import ContextManager
 from .modes import ReasoningMode, get_mode
 from .tools import Toolbox
-from .vision import drop_old_images, load_image_part
+from .vision import drop_old_images, image_in_context, load_image_part
 
 SYSTEM_PROMPT = """You are a hands-on assistant operating the user's Linux machine and projects via tools.
 
@@ -47,6 +47,8 @@ SYSTEM_PROMPT = """You are a hands-on assistant operating the user's Linux machi
 - Answer concisely when done. State what changed and anything unresolved. Markdown is rendered.
 - Skills are defaults: paths/targets named in the user's request ('this folder', a file) always override paths written in a skill.
 - Describe images only from what you actually see in them; don't repeat what you assumed beforehand.
+- Viewed images stay visible in the conversation, each labeled [image: path]. Compare candidates by
+  those labels; only view_image again if an image was removed to save context.
 - If you discover a non-obvious, reusable fact (an API quirk, a user preference), call propose_note."""
 
 EventFn = Callable[[str, dict], None]
@@ -152,7 +154,7 @@ class Agent:
         parts: list[dict] = [{"type": "text", "text": text}]
         for p in images:
             part, note = load_image_part(p, self.cfg)
-            parts.append(part)
+            parts += [{"type": "text", "text": f"[image: {self.tb.image_label(p)}]"}, part]
             self.emit("notice", text=f"image {note}")
         self.messages.append({
             "role": "user", "content": parts if images else text,
@@ -244,10 +246,13 @@ class Agent:
                 out, is_err = err, True
             elif self._stop.is_set():
                 out, is_err = "Error: cancelled by the user before it ran.", True
+            elif name == "view_image" and image_in_context(self.messages, label := self.tb.image_label(str(args.get("path", "")))):
+                out, is_err = (f"[image: {label}] is still visible above in this conversation; look at it there "
+                               "instead of viewing it again."), False
             else:
                 sig = (name, json.dumps(args, sort_keys=True))
                 seen[sig] = seen.get(sig, 0) + 1
-                if seen[sig] >= 3 and name != "bash":
+                if seen[sig] >= 3 and name not in ("bash", "view_image"):
                     out, is_err = "Error: you've made this exact call 3 times. It won't change. Try something different.", True
                 else:
                     out, is_err = self.tb.run(name, args)
@@ -268,7 +273,7 @@ class Agent:
 
         if self.tb.pending_images:
             self.messages.append({"role": "user", "content": [
-                {"type": "text", "text": "(image from view_image)"}, *self.tb.pending_images]})
+                {"type": "text", "text": "(images from view_image)"}, *self.tb.pending_images]})
             self.tb.pending_images.clear()
             drop_old_images(self.messages, self.cfg.max_images_in_context)
         return any_failed

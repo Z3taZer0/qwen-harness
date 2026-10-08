@@ -228,17 +228,24 @@ class Toolbox:
             for fn in fns:
                 yield Path(dp) / fn
 
+    def image_label(self, path: str) -> str:
+        """Stable name for an image, used to label it in context (URL or absolute path)."""
+        return path if path.startswith(("http://", "https://")) else str(self.path(path))
+
     def view_image(self, path: str) -> str:
         from .vision import load_image_part
 
+        label = self.image_label(path)
         if path.startswith(("http://", "https://")):
             path = web.fetch_to_temp(path)
         p = self.path(path)
         if not p.is_file():
             return f"Error: not a file: {p}"
         part, note = load_image_part(str(p), self.cfg)
-        self.pending_images.append(part)
-        return f"Image attached below: {note}"
+        # Each image is preceded by its own label so the model knows which file it is
+        # looking at, even when several are viewed in one step.
+        self.pending_images += [{"type": "text", "text": f"[image: {label}]"}, part]
+        return f"Image attached below as [image: {label}] ({note.split(' (', 1)[-1].rstrip(')')})"
 
     def inspect_image(self, path: str) -> str:
         """Inspect image dimensions, format, and aspect ratio without loading it as visual tokens."""

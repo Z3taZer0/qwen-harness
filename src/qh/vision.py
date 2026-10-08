@@ -59,6 +59,22 @@ def drop_old_images(messages: list[dict], keep: int) -> bool:
     ]
     changed = False
     for i, j in slots[: max(0, len(slots) - keep)]:
-        messages[i]["content"][j] = {"type": "text", "text": "[older image removed to save context]"}
+        parts = messages[i]["content"]
+        prev = parts[j - 1].get("text", "") if j > 0 else ""
+        name = prev[len("[image: "):-1] if prev.startswith("[image: ") else ""
+        parts[j] = {"type": "text", "text": f"(image {name} removed to save context; view_image it again if needed)"
+                    if name else "[older image removed to save context]"}
         changed = True
     return changed
+
+
+def image_in_context(messages: list[dict], label: str) -> bool:
+    """True if the image labeled `label` is still present (not evicted) in the history."""
+    tag = f"[image: {label}]"
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            for a, b in zip(c, c[1:]):
+                if a.get("text") == tag and b.get("type") == "image_url":
+                    return True
+    return False
