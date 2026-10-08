@@ -3,10 +3,33 @@ Instead of a simple numeric effort/tokens toggle, reasoning modes define specifi
 - how the agent approaches the problem in its thoughts
 - what criteria it weighs
 - when and how intensely thinking is enabled per step.
+
+Custom modes: drop a markdown file in ~/.config/qh/modes/, e.g. `review.md`:
+
+    ---
+    id: review
+    name: Code Review
+    description: Read-only critical review of a change
+    thinking: always            # always | adaptive | initial_only | off
+    temperature: 0.6
+    top_p: 0.95
+    ---
+    Reasoning Pattern (Review):
+    - ...
+
+The body becomes the mode's system guidance. A file whose id matches a built-in mode
+replaces it, so the built-ins below can be tuned without touching the code.
 """
 from __future__ import annotations
+
+import re
 from dataclasses import dataclass
 from typing import Literal
+
+from .config import CONFIG_DIR
+
+MODES_DIR = CONFIG_DIR / "modes"
+POLICIES = ("always", "adaptive", "initial_only", "off")
 
 @dataclass
 class ReasoningMode:
@@ -69,6 +92,39 @@ MODES: dict[str, ReasoningMode] = {
         top_p=0.8,
     ),
 }
+
+def _load_custom() -> None:
+    if not MODES_DIR.is_dir():
+        return
+    for f in sorted(MODES_DIR.glob("*.md")):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        m = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+        meta, body = ({}, text) if not m else (dict(
+            (k.strip(), v.strip().strip("\"'")) for k, v in
+            (line.split(":", 1) for line in m.group(1).splitlines() if ":" in line)
+        ), m.group(2))
+        mid = meta.get("id") or f.stem
+        base = MODES.get(mid)
+        policy = meta.get("thinking", base.thinking_policy if base else "adaptive").split("#")[0].strip()
+        try:
+            MODES[mid] = ReasoningMode(
+                id=mid,
+                name=meta.get("name") or (base.name if base else mid.title()),
+                description=meta.get("description") or (base.description if base else ""),
+                thinking_policy=policy if policy in POLICIES else "adaptive",
+                system_guidance=body.strip() or (base.system_guidance if base else ""),
+                temperature=float(meta.get("temperature", base.temperature if base else 0.6)),
+                top_p=float(meta.get("top_p", base.top_p if base else 0.95)),
+            )
+        except ValueError:
+            continue
+
+
+_load_custom()
+
 
 def get_mode(mode_id: str) -> ReasoningMode:
     return MODES.get(mode_id, MODES["auto"])

@@ -17,8 +17,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-HOME = Path.home()
-CFG_DIR = HOME / ".config" / "qh"
+from .config import CONFIG_DIR as CFG_DIR
+
 SKILL_DIRS = [CFG_DIR / "skills"]
 PROFILE_FILES = [CFG_DIR / "profile.md"]
 NOTES = CFG_DIR / "notes.md"
@@ -67,7 +67,7 @@ def discover_skills() -> dict[str, Skill]:
 def skill_index(skills: dict[str, Skill]) -> str:
     if not skills:
         return ""
-    lines = [f"- {s.name}: {re.sub(r'\\s+', ' ', s.description)[:170]}" for s in skills.values()]
+    lines = [f"- {s.name}: {' '.join(s.description.split())[:170]}" for s in skills.values()]
     return ("\n\nSkills (playbooks with hard-won details). If a task matches one, call load_skill(name) "
             "BEFORE starting:\n" + "\n".join(lines))
 

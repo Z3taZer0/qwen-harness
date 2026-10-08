@@ -1,21 +1,37 @@
+"""The agent loop. Frontend-agnostic: everything user-visible is reported through
+`on_event(kind, data)` so the CLI and the GTK app render the same stream.
+
+Events
+  step       {step, think}                         a model call starts
+  reasoning  {text}                                streamed thought chunk
+  content    {text}                                streamed answer chunk
+  tool_start {id, name, args}
+  tool_end   {id, name, args, output, error, dt}
+  usage      {prompt, cached, completion, dt, tps, think, ctx}
+  notice     {text}                                compaction, limits, mode switches...
+  cancelled  {}
+"""
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import platform
-import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Callable
 
-from .client import LLM, Completion
-from . import knowledge
+from . import knowledge, sessions
+from .client import LLM, Cancelled, Completion
 from .config import Config
 from .context import ContextManager
-from .modes import get_mode, ReasoningMode
+from .modes import ReasoningMode, get_mode
 from .tools import Toolbox
-from .vision import count_images, drop_old_images, load_image_part
+from .vision import drop_old_images, load_image_part
 
-SYSTEM_PROMPT = """You are a coding agent working directly in the user's project via tools.
+SYSTEM_PROMPT = """You are a hands-on assistant operating the user's Linux machine and projects via tools.
 
 - Be efficient: act, don't narrate. Prefer one tool call that answers the question over several.
 - Issue independent tool calls in the same turn (e.g. read several files at once).
@@ -26,106 +42,168 @@ SYSTEM_PROMPT = """You are a coding agent working directly in the user's project
 - For web tasks: use web_search / fetch_url (prefer sites with JSON APIs), download to save files, and
   view_image on small thumbnail URLs to judge content BEFORE downloading large files. Never loop with
   sleep; if a source fails twice, switch source. Don't call bash curl for what these tools do.
-- Answer concisely when done. State what changed and anything unresolved.
+- Answer concisely when done. State what changed and anything unresolved. Markdown is rendered.
 - Skills are defaults: paths/targets named in the user's request ('this folder', a file) always override paths written in a skill.
 - Describe images only from what you actually see in them; don't repeat what you assumed beforehand.
 - If you discover a non-obvious, reusable fact (an API quirk, a user preference), call propose_note."""
 
-DIM, RESET = "\033[2m", "\033[0m"
+EventFn = Callable[[str, dict], None]
+
+
+def system_prompt() -> str:
+    """~/.config/qh/system.md replaces the built-in prompt entirely when present."""
+    custom = knowledge.CFG_DIR / "system.md"
+    try:
+        text = custom.read_text().strip()
+    except OSError:
+        text = ""
+    return text or SYSTEM_PROMPT
 
 
 class Agent:
-    def __init__(self, cfg: Config, cwd: str, out=sys.stdout):
-        self.cfg, self.out = cfg, out
+    def __init__(self, cfg: Config, cwd: str, on_event: EventFn | None = None):
+        self.cfg = cfg
+        self.on_event: EventFn = on_event or (lambda kind, data: None)
         self.mode: ReasoningMode = get_mode(cfg.mode)
         self.llm = LLM(cfg)
         self.tb = Toolbox(cfg, cwd)
         self.ctx = ContextManager(cfg, self.llm)
         self.tool_schemas = self.tb.schemas()
-
-        mode_sys = f"\n\n---\n{self.mode.system_guidance}"
-        full_system = SYSTEM_PROMPT + knowledge.skill_index(self.tb.skills) + mode_sys
-        self.messages: list[dict] = [{"role": "system", "content": full_system}]
-        self.ctx_info = knowledge.session_context(self.tb.cwd)
-        self.env_note = (
-            f"[env] cwd={self.tb.cwd} os={platform.system()} shell=bash "
-            f"date={time.strftime('%Y-%m-%d')} mode={self.mode.id}"
-        )
+        self.messages: list[dict] = [{"role": "system", "content": self._system()}]
         self._first = True
+        self._pending: list[str] = []  # notes prepended to the next user message
+        self._stop = threading.Event()
+        self.busy = False
         self.stats = {"prompt": 0, "cached": 0, "completion": 0, "steps": 0}
+        self.session_id = sessions.new_id()
+        self.title = ""
+        self.created = time.time()
+
+    # ------------------------------------------------------------------ setup
+    def _system(self) -> str:
+        return system_prompt() + knowledge.skill_index(self.tb.skills) + f"\n\n---\n{self.mode.system_guidance}"
+
+    def _env_note(self) -> str:
+        return (f"[env] cwd={self.tb.cwd} os={platform.system()} shell=bash "
+                f"date={time.strftime('%Y-%m-%d %H:%M')} mode={self.mode.id}")
+
+    @property
+    def started(self) -> bool:
+        return any(m["role"] != "system" for m in self.messages)
 
     def set_mode(self, mode_id: str) -> None:
-        self.mode = get_mode(mode_id)
-        self.cfg.mode = self.mode.id
-        mode_sys = f"\n\n---\n{self.mode.system_guidance}"
-        full_system = SYSTEM_PROMPT + knowledge.skill_index(self.tb.skills) + mode_sys
-        if self.messages and self.messages[0]["role"] == "system":
-            self.messages[0]["content"] = full_system
+        """Switching mode mid-conversation must not rewrite the system prompt (that would
+        throw away the whole prefix cache), so the new guidance rides on the next user turn."""
+        new = get_mode(mode_id)
+        if new.id == self.mode.id:
+            return
+        self.mode = new
+        self.cfg.mode = new.id
+        if not self.started:
+            self.messages[0]["content"] = self._system()
+        else:
+            self._pending = [p for p in self._pending if not p.startswith("[mode")]
+            self._pending.append(f"[mode switched to {new.id}]\n{new.system_guidance}")
 
-    def say(self, s: str) -> None:
-        if self.out:
-            self.out.write(s)
-            self.out.flush()
+    def set_cwd(self, path: str) -> None:
+        p = Path(os.path.expanduser(path)).resolve()
+        if not p.is_dir():
+            raise ValueError(f"not a directory: {p}")
+        self.tb.cwd = p
+        if self.started:
+            self._pending = [x for x in self._pending if not x.startswith("[cwd")]
+            self._pending.append(f"[cwd changed to {p}]")
 
-    def user_turn(self, text: str, images: list[str] | None = None, on_token=None) -> str:
-        parts: list[dict] = []
+    def emit(self, kind: str, **data) -> None:
+        try:
+            self.on_event(kind, data)
+        except Exception:
+            pass  # a rendering bug must never break the agent loop
+
+    def cancel(self) -> None:
+        """Stop the current turn from any thread: aborts streaming and running commands."""
+        self._stop.set()
+        self.tb.stop.set()
+        self.llm.cancel()
+
+    # ------------------------------------------------------------------- turn
+    def user_turn(self, text: str, images: list[str] | None = None) -> str:
+        self._stop.clear()
+        self.tb.stop.clear()
+        self.llm.reset()
+        self.busy = True
+        try:
+            return self._turn(text, images or [])
+        finally:
+            self.busy = False
+            self.save()
+
+    def _turn(self, text: str, images: list[str]) -> str:
+        display = text
+        pre = []
         if self._first:
-            pre = "\n\n".join(x for x in (self.env_note, self.ctx_info) if x)
-            text, self._first = f"{pre}\n\n{text}", False
-        parts.append({"type": "text", "text": text})
-        for p in images or []:
+            pre += [self._env_note(), knowledge.session_context(self.tb.cwd)]
+        pre += self._pending
+        if any(pre):
+            text = "\n\n".join(x for x in (*pre, text) if x)
+        parts: list[dict] = [{"type": "text", "text": text}]
+        for p in images:
             part, note = load_image_part(p, self.cfg)
             parts.append(part)
-            self.say(f"{DIM}[image {note}]{RESET}\n")
-        self.messages.append({"role": "user", "content": parts if images else text})
+            self.emit("notice", text=f"image {note}")
+        self.messages.append({
+            "role": "user", "content": parts if images else text,
+            "_display": display, "_images": images, "_ts": time.time(),
+            "_first": self._first, "_notes": list(self._pending),
+        })
+        self._first, self._pending = False, []
+        if not self.title:
+            self.title = sessions.title_from(display)
         if images:
             drop_old_images(self.messages, self.cfg.max_images_in_context)
 
-        import itertools
-        step_iter = range(self.cfg.max_steps) if self.cfg.max_steps > 0 else itertools.count()
-
+        steps = range(self.cfg.max_steps) if self.cfg.max_steps > 0 else itertools.count()
         last_text, failed, seen = "", False, {}
-        for step in step_iter:
-            if self.ctx.maybe_compact(self.messages, log=lambda s: self.say(f"{DIM}{s}{RESET}\n")):
-                pass
-
+        for step in steps:
+            if self._stop.is_set():
+                return self._cancelled(last_text)
+            try:
+                self.ctx.maybe_compact(self.messages, log=lambda s: self.emit("notice", text=s))
+            except Cancelled:
+                return self._cancelled(last_text)
             think = self._thinking(step, failed)
+            self.emit("step", step=step, think=think)
             t0 = time.time()
-
-            def _handle_content(chunk: str):
-                self.say(chunk)
-                if on_token:
-                    on_token("content", chunk)
-
-            def _handle_reasoning(chunk: str):
-                if on_token:
-                    on_token("reasoning", chunk)
-
-            res = self.llm.chat(
-                self.messages,
-                self.tool_schemas,
-                thinking=think,
-                temperature=self.mode.temperature,
-                top_p=self.mode.top_p,
-                on_content=_handle_content,
-                on_reasoning=_handle_reasoning,
-            )
+            try:
+                res = self.llm.chat(
+                    self.messages, self.tool_schemas, thinking=think,
+                    temperature=self.mode.temperature, top_p=self.mode.top_p,
+                    on_content=lambda c: self.emit("content", text=c),
+                    on_reasoning=lambda c: self.emit("reasoning", text=c),
+                )
+            except Cancelled as c:
+                p = c.partial
+                msg = {"role": "assistant", "content": (p.content + "\n\n" if p.content else "") + "[interrupted by the user]"}
+                self.messages.append(msg)
+                return self._cancelled(p.content or last_text)
             self._account(res, time.time() - t0, think)
             self.messages.append(res.to_message())
             self.ctx.observe(res.prompt_tokens, len(self.messages) - 1)
             last_text = res.content or last_text
             if res.finish_reason == "length" and not res.tool_calls:
+                self.emit("notice", text="output hit max_tokens, asking the model to continue")
                 self.messages.append({"role": "user", "content": "You were cut off. Continue, but be brief."})
                 continue
             if not res.tool_calls:
-                self.say("\n")
                 return res.content
-            failed = self._run_tools(res, seen, on_token=on_token)
-        if self.cfg.max_steps > 0:
-            msg = f"\n[Reached maximum step limit ({self.cfg.max_steps} turns). Stopping loop.]\n"
-            self.say(f"{DIM}{msg}{RESET}")
-            if on_token:
-                on_token("system", msg)
+            failed = self._run_tools(res, seen)
+            if self._stop.is_set():
+                return self._cancelled(last_text)
+        self.emit("notice", text=f"reached the step limit ({self.cfg.max_steps}); stopping")
+        return last_text
+
+    def _cancelled(self, last_text: str) -> str:
+        self.emit("cancelled")
         return last_text
 
     def _thinking(self, step: int, failed: bool) -> bool:
@@ -133,18 +211,16 @@ class Agent:
             return True
         if self.cfg.thinking == "off":
             return False
-
         policy = self.mode.thinking_policy
         if policy == "always":
             return True
-        elif policy == "off":
+        if policy == "off":
             return False
-        elif policy == "initial_only":
+        if policy == "initial_only":
             return step == 0
-        else:  # adaptive
-            return step == 0 or failed
+        return step == 0 or failed  # adaptive
 
-    def _run_tools(self, res: Completion, seen: dict, on_token=None) -> bool:
+    def _run_tools(self, res: Completion, seen: dict) -> bool:
         parsed = []
         for tc in res.tool_calls:
             name = tc["function"]["name"]
@@ -159,13 +235,21 @@ class Agent:
 
         def one(item):
             tc, name, args, err = item
+            t0 = time.time()
+            self.emit("tool_start", id=tc["id"], name=name, args=args)
             if err:
-                return err, True
-            sig = (name, json.dumps(args, sort_keys=True))
-            seen[sig] = seen.get(sig, 0) + 1
-            if seen[sig] >= 3 and name not in ("bash",):
-                return "Error: you've made this exact call 3 times. It won't change. Try something different.", True
-            return self.tb.run(name, args)
+                out, is_err = err, True
+            elif self._stop.is_set():
+                out, is_err = "Error: cancelled by the user before it ran.", True
+            else:
+                sig = (name, json.dumps(args, sort_keys=True))
+                seen[sig] = seen.get(sig, 0) + 1
+                if seen[sig] >= 3 and name != "bash":
+                    out, is_err = "Error: you've made this exact call 3 times. It won't change. Try something different.", True
+                else:
+                    out, is_err = self.tb.run(name, args)
+            self.emit("tool_end", id=tc["id"], name=name, args=args, output=out, error=is_err, dt=time.time() - t0)
+            return out, is_err
 
         read_only = all(self.tb.tools.get(n) and self.tb.tools[n].read_only for _, n, _, _ in parsed)
         if len(parsed) > 1 and read_only:
@@ -175,14 +259,9 @@ class Agent:
             results = [one(p) for p in parsed]
 
         any_failed = False
-        for (tc, name, args, _), (out, is_err) in zip(parsed, results):
+        for (tc, name, _, _), (out, is_err) in zip(parsed, results):
             any_failed |= is_err
-            brief = json.dumps(args, ensure_ascii=False)
-            info = f"▸ {name} {brief[:140]}{'…' if len(brief) > 140 else ''}{' ✗' if is_err else ''}"
-            self.say(f"{DIM}{info}{RESET}\n")
-            if on_token:
-                on_token("tool", info + "\n")
-            self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
+            self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out, "_err": is_err})
 
         if self.tb.pending_images:
             self.messages.append({"role": "user", "content": [
@@ -197,8 +276,87 @@ class Agent:
         s["cached"] += res.cached_tokens
         s["completion"] += res.completion_tokens
         s["steps"] += 1
-        tps = res.completion_tokens / dt if dt > 0 else 0
-        self.say(
-            f"\n{DIM}[{res.prompt_tokens}p ({res.cached_tokens} cached) + {res.completion_tokens}c "
-            f"in {dt:.1f}s = {tps:.0f} tok/s, mode={self.mode.id}, think={'on' if think else 'off'}]{RESET}\n"
-        )
+        self.emit("usage", prompt=res.prompt_tokens, cached=res.cached_tokens, completion=res.completion_tokens,
+                  dt=dt, tps=res.completion_tokens / dt if dt > 0 else 0, think=think,
+                  ctx=res.prompt_tokens + res.completion_tokens)
+
+    # ------------------------------------------------------------ inspection
+    def context_tokens(self) -> int:
+        return self.ctx.estimate(self.messages) if self.started else 0
+
+    def compact(self) -> bool:
+        return self.ctx.maybe_compact(self.messages, log=lambda s: self.emit("notice", text=s), force=True)
+
+    def undo(self) -> tuple[str, list[str]] | None:
+        """Remove the last user turn and everything after it. Returns its (text, images)."""
+        idx = next((i for i in range(len(self.messages) - 1, 0, -1) if "_display" in self.messages[i]), None)
+        if idx is None:
+            return None
+        m = self.messages[idx]
+        del self.messages[idx:]
+        if m.get("_first"):
+            self._first = True
+        # Re-queue the notes that rode on the removed turn; newer notes of the same kind win.
+        notes = {}
+        for n in [*(m.get("_notes") or []), *self._pending]:
+            notes[n.split("]", 1)[0].split(" ")[0]] = n
+        self._pending = list(notes.values())
+        if not self.started:
+            self.title = ""
+        self.ctx.observe(0, 0)  # history changed: fall back to the char estimate
+        self.save()
+        return m["_display"], list(m.get("_images") or [])
+
+    def transcript(self):
+        """Yield display items to rebuild a conversation view:
+        ("user", text, images) ("reasoning", text) ("assistant", text)
+        ("tool", name, args, output, error) ("summary", text)"""
+        results = {m["tool_call_id"]: m for m in self.messages if m["role"] == "tool"}
+        for m in self.messages[1:]:
+            role, c = m["role"], m.get("content")
+            if role == "user":
+                if "_display" in m:
+                    yield ("user", m["_display"], m.get("_images") or [])
+                elif isinstance(c, str) and c.startswith("[Summary of earlier work"):
+                    yield ("summary", c)
+            elif role == "assistant":
+                r = m.get("reasoning_content") or m.get("reasoning")
+                if r:
+                    yield ("reasoning", r)
+                if c and c != "Understood. Continuing from that summary.":
+                    yield ("assistant", c)
+                for tc in m.get("tool_calls") or []:
+                    try:
+                        args = json.loads(tc["function"]["arguments"] or "{}")
+                    except ValueError:
+                        args = {"_raw": tc["function"]["arguments"]}
+                    res = results.get(tc["id"], {})
+                    yield ("tool", tc["function"]["name"], args, res.get("content", ""), bool(res.get("_err")))
+
+    # ------------------------------------------------------------ persistence
+    def save(self) -> None:
+        if not self.cfg.save_sessions or not self.started:
+            return
+        try:
+            sessions.save(self.session_id, {
+                "title": self.title, "created": self.created, "updated": time.time(),
+                "cwd": str(self.tb.cwd), "mode": self.mode.id, "model": self.cfg.model,
+                "turns": sum(1 for m in self.messages if "_display" in m),
+                "stats": self.stats, "messages": self.messages,
+            })
+        except OSError as e:
+            self.emit("notice", text=f"could not save session: {e}")
+
+    def resume(self, sid: str) -> None:
+        d = sessions.load(sid)
+        self.session_id, self.title = sid, d.get("title", "")
+        self.created = d.get("created", time.time())
+        self.messages = d["messages"]
+        self.stats = {**self.stats, **d.get("stats", {})}
+        self.mode = get_mode(d.get("mode", self.mode.id))
+        self.cfg.mode = self.mode.id
+        if d.get("cwd") and Path(d["cwd"]).is_dir():
+            self.tb.cwd = Path(d["cwd"])
+        self._first = not any("_display" in m for m in self.messages)
+        self._pending = []
+        self.ctx.observe(0, 0)

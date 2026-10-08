@@ -1,12 +1,14 @@
 [project]
 name = "qh"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lean agentic harness tuned for Qwen3.x 27B on a local vLLM server"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27",
     "pillow>=10",
-    "pygobject>=3.46"
+    "pygobject>=3.46",
+    "rich>=13",
+    "prompt_toolkit>=3.0.40",
 ]
 
 [project.scripts]

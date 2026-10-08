@@ -33,6 +33,19 @@ class Completion:
         return m
 
 
+class Cancelled(Exception):
+    """Raised when a request is aborted by the user. Carries the partial completion."""
+
+    def __init__(self, partial: Completion):
+        super().__init__("cancelled")
+        self.partial = partial
+
+
+def wire(messages: list[dict]) -> list[dict]:
+    """Drop harness-private keys (`_display`, `_turn`, ...) before sending to the server."""
+    return [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+
+
 class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -41,6 +54,28 @@ class LLM:
             headers={"Authorization": f"Bearer {cfg.api_key}"},
             timeout=httpx.Timeout(connect=10, read=600, write=60, pool=10),
         )
+        self._resp: httpx.Response | None = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Abort the in-flight stream from any thread. Closing the connection makes vLLM
+        abort the request too, so the GPU is freed immediately."""
+        self._cancelled = True
+        r = self._resp
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    def reset(self) -> None:
+        self._cancelled = False
+
+    def models(self, timeout: float = 4.0) -> list[str]:
+        """Served model ids (raises on connection problems)."""
+        r = self.http.get("/models", timeout=timeout)
+        r.raise_for_status()
+        return [m["id"] for m in r.json().get("data", [])]
 
     def chat(
         self,
@@ -58,7 +93,7 @@ class LLM:
 
         body = {
             "model": self.cfg.model,
-            "messages": messages,
+            "messages": wire(messages),
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": max_tokens or self.cfg.max_tokens,
@@ -76,10 +111,33 @@ class LLM:
 
         out = Completion()
         calls: dict[int, dict] = {}
+        if self._cancelled:
+            raise Cancelled(out)
+        try:
+            self._stream(body, out, calls, on_content, on_reasoning)
+        except httpx.ConnectError as e:
+            raise RuntimeError(f"cannot reach vLLM at {self.cfg.base_url} ({e}). Is the server up?") from e
+        except Exception:
+            if not self._cancelled:
+                raise
+        finally:
+            self._resp = None
+        out.tool_calls = [calls[i] for i in sorted(calls)]
+        for i, c in enumerate(out.tool_calls):
+            c["id"] = c["id"] or f"call_{i}"
+        if self._cancelled:
+            out.finish_reason = "cancelled"
+            raise Cancelled(out)
+        return out
+
+    def _stream(self, body, out: Completion, calls: dict, on_content, on_reasoning) -> None:
         with self.http.stream("POST", "/chat/completions", json=body) as r:
+            self._resp = r
             if r.status_code != 200:
                 raise RuntimeError(f"vLLM {r.status_code}: {r.read().decode()[:2000]}")
             for line in r.iter_lines():
+                if self._cancelled:
+                    break
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -111,7 +169,3 @@ class LLM:
                         c["function"]["arguments"] += fn.get("arguments") or ""
                     if ch.get("finish_reason"):
                         out.finish_reason = ch["finish_reason"]
-        out.tool_calls = [calls[i] for i in sorted(calls)]
-        for i, c in enumerate(out.tool_calls):
-            c["id"] = c["id"] or f"call_{i}"
-        return out

@@ -53,16 +53,16 @@ class ContextManager:
             sum(_msg_chars(m) for m in messages) / self.cfg.chars_per_token)
 
     # ------------------------------------------------------------------ public
-    def maybe_compact(self, messages: list[dict], tools_tokens: int = 0, log=print) -> bool:
+    def maybe_compact(self, messages: list[dict], tools_tokens: int = 0, log=print, force: bool = False) -> bool:
         limit = int(self.cfg.context_window * self.cfg.compact_at)
-        if self.estimate(messages) < limit:
+        if not force and self.estimate(messages) < limit:
             return False
         before = self.estimate(messages)
         target = int(self.cfg.context_window * self.cfg.compact_target)
 
         self._elide(messages)
         est = self.estimate_after_edit(messages, before)
-        if est > target:
+        if est > target or force:
             self._summarize(messages)
             est = self.estimate_after_edit(messages, before)
         self.real_len = 0  # force heuristic until next server usage report

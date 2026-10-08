@@ -6,7 +6,10 @@ import fnmatch
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -44,6 +47,26 @@ def _obj(props: dict, required: list[str]) -> dict:
 
 S, I = {"type": "string"}, {"type": "integer"}
 
+# Commands that need an explicit yes when cfg.confirm_dangerous is on. Edit to taste.
+DANGEROUS = [
+    (r"\brm\s+(-[^\s]*[rRf][^\s]*\s+)+", "recursive/forced delete"),
+    (r"(^|[;&|]\s*|\s)(sudo|doas|pkexec)\s", "runs as root"),
+    (r"\bdd\s+.*\bof=", "raw disk write"),
+    (r"\bmkfs(\.\w+)?\b|\bwipefs\b|\bfdisk\b|\bparted\b", "filesystem/partition change"),
+    (r"\b(shutdown|reboot|poweroff|halt)\b|systemctl\s+(poweroff|reboot|suspend|hibernate)", "power state"),
+    (r">\s*/dev/(sd|nvme|vd|mmcblk)", "raw disk write"),
+    (r"\bgit\s+(push\s+.*(--force|-f\b)|reset\s+--hard|clean\s+-\w*f)", "destructive git"),
+    (r"\b(chmod|chown)\s+-R\s+\S+\s+/(\s|$)", "recursive permission change on /"),
+    (r":\(\)\s*\{", "fork bomb"),
+]
+
+
+def danger(command: str) -> str | None:
+    for rx, why in DANGEROUS:
+        if re.search(rx, command):
+            return why
+    return None
+
 
 class Toolbox:
     def __init__(self, cfg: Config, cwd: str):
@@ -52,7 +75,8 @@ class Toolbox:
         self.pending_images: list[dict] = []  # image parts to inject after tool results
         self.read_files: set[str] = set()
         self.skills = knowledge.discover_skills()
-        self.ask = None  # set by the agent: callable(str)->bool for user approval
+        self.ask = None  # set by the frontend: callable(str)->bool for user approval
+        self.stop = threading.Event()  # set to abort a running bash command
         self.tools: dict[str, Tool] = {t.name: t for t in self._build()}
 
     # ---------------------------------------------------------------- helpers
@@ -79,16 +103,38 @@ class Toolbox:
 
     # ------------------------------------------------------------------ tools
     def bash(self, command: str, timeout: int | None = None) -> str:
-        try:
-            r = subprocess.run(
-                command, shell=True, cwd=self.cwd, capture_output=True, text=True,
-                timeout=timeout or self.cfg.bash_timeout, stdin=subprocess.DEVNULL,
-            )
-        except subprocess.TimeoutExpired as e:
-            partial = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-            return f"Error: timed out after {timeout or self.cfg.bash_timeout}s\n{clip(partial, 3000)}"
-        out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
-        return f"{out.strip() or '(no output)'}\n[exit {r.returncode}]"
+        if self.cfg.confirm_dangerous and (why := danger(command)):
+            if self.ask is None:
+                return f"Error: command needs user approval ({why}) but no one can approve it here. Find a safer way."
+            if not self.ask(f"Allow command ({why})?\n\n{command}"):
+                return "Error: the user denied this command. Do not retry it; ask or choose another approach."
+        limit = timeout or self.cfg.bash_timeout
+        p = subprocess.Popen(
+            command, shell=True, cwd=self.cwd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+            start_new_session=True,  # own process group, so we can kill grandchildren too
+        )
+        deadline, reason = time.monotonic() + limit, ""
+        while True:
+            try:
+                out, err = p.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if self.stop.is_set():
+                    reason = "Error: interrupted by the user"
+                elif time.monotonic() > deadline:
+                    reason = f"Error: timed out after {limit}s"
+                if reason:
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    out, err = p.communicate()
+                    break
+        text = (out or "") + (("\n[stderr]\n" + err) if err else "")
+        if reason:
+            return f"{reason}\n{clip(text.strip(), 3000)}"
+        return f"{text.strip() or '(no output)'}\n[exit {p.returncode}]"
 
     def read_file(self, path: str, start: int = 1, end: int = 400) -> str:
         p = self.path(path)
