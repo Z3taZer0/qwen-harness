@@ -38,6 +38,7 @@ class Config:
     # --- vision (server: --mm-processor-kwargs min 65536 / max 2097152 px) ---
     image_max_pixels: int = 360_000    # ~450 visual tokens (fast inference)
     image_min_pixels: int = 65_536     # matches server min window
+    contact_sheet_pixels: int = 1_000_000  # one grid image for comparing candidates (~1300 tokens)
     max_images_in_context: int = 7     # server allows 8; evicting earlier images busts the prefix cache
 
     # --- tools / safety -----------------------------------------------------

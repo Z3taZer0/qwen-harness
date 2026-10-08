@@ -87,6 +87,7 @@ class LLM:
         top_p: float | None = None,
         on_content: Callable[[str], None] | None = None,
         on_reasoning: Callable[[str], None] | None = None,
+        tool_choice: str | None = None,
     ) -> Completion:
         temp = temperature if temperature is not None else (0.6 if thinking else 0.7)
         tp = top_p if top_p is not None else (0.95 if thinking else 0.8)
@@ -108,6 +109,8 @@ class LLM:
         if tools:
             body["tools"] = tools
             body["parallel_tool_calls"] = True
+            if tool_choice:
+                body["tool_choice"] = tool_choice  # tools stay in the prompt, so the prefix cache holds
 
         out = Completion()
         calls: dict[int, dict] = {}

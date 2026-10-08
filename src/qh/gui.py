@@ -126,6 +126,8 @@ def brief(name: str, args: dict, n: int = 90) -> str:
         s = args["url"]
     elif "query" in args:
         s = args["query"]
+    elif isinstance(args.get("paths"), list):
+        s = f"{len(args['paths'])} images: " + ", ".join(Path(str(p)).name for p in args["paths"])
     else:
         s = " ".join(f"{k}={v}" for k, v in args.items())
     s = " ".join(str(s).split())
@@ -352,9 +354,10 @@ class ToolCard(Gtk.Box):
             pic.set_margin_top(6)
 
     def _image_result(self, output: str, error: bool) -> str | None:
-        if error or self.name not in ("download", "set_wallpaper", "view_image", "inspect_image", "identify"):
+        if error or self.name not in ("download", "set_wallpaper", "view_image", "inspect_image", "identify",
+                                      "contact_sheet"):
             return None
-        m = re.search(r"(?:Saved|Wallpaper set:) (\S+)", output)
+        m = re.search(r"(?:Saved|Wallpaper set:|Contact sheet) (\S+)", output)
         p = m.group(1) if m else self.args.get("path", "")
         p = os.path.expanduser(p) if isinstance(p, str) else ""
         return p if p and Path(p).suffix.lower() in IMAGE_EXT and Path(p).is_file() else None

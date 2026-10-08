@@ -28,7 +28,9 @@ part of how it reasons is a plain file you can edit.
 - **One-call wallpapers.** `set_wallpaper` files the image into your wallpaper folder and applies it.
 - **Fast vision pipeline:** bounded-pixel JPEG downscaling, with old images evicted to protect the cache.
 - **Tools:** shell, read/write/edit file, grep/find, web search, fetch, download, image
-  inspect/view, set wallpaper, skill loader, memory notes.
+  inspect/view, contact sheet (compare many images in one view), set wallpaper, skill loader, memory notes.
+- **Loop breaker.** Steps that only repeat what the model already has are detected: after 2 it gets
+  nudged to decide, after 4 tools are switched off and it must give its answer.
 
 ## Install
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import os
 import platform
 import threading
@@ -49,6 +50,8 @@ SYSTEM_PROMPT = """You are a hands-on assistant operating the user's Linux machi
 - Describe images only from what you actually see in them; don't repeat what you assumed beforehand.
 - Viewed images stay visible in the conversation, each labeled [image: path]. Compare candidates by
   those labels; only view_image again if an image was removed to save context.
+- To choose between several images, call contact_sheet once with all candidates (one numbered grid),
+  pick from it, then act. Judge each image once; don't re-inspect images you already judged.
 - If you discover a non-obvious, reusable fact (an API quirk, a user preference), call propose_note."""
 
 EventFn = Callable[[str, dict], None]
@@ -168,7 +171,7 @@ class Agent:
             drop_old_images(self.messages, self.cfg.max_images_in_context)
 
         steps = range(self.cfg.max_steps) if self.cfg.max_steps > 0 else itertools.count()
-        last_text, failed, seen = "", False, {}
+        last_text, failed, seen, stall = "", False, {}, 0
         for step in steps:
             if self._stop.is_set():
                 return self._cancelled(last_text)
@@ -201,11 +204,51 @@ class Agent:
                 continue
             if not res.tool_calls:
                 return res.content
-            failed = self._run_tools(res, seen)
+            failed, progress = self._run_tools(res, seen)
             if self._stop.is_set():
                 return self._cancelled(last_text)
+            # Loop breaker: steps that only repeat what the model already has don't count as
+            # progress. Nudge after 2 such steps, force a decision after 4.
+            stall = 0 if progress else stall + 1
+            if stall == 2:
+                self.emit("notice", text="the model is repeating itself; nudging it to decide")
+                self.messages.append({"role": "user", "content": self._stall_note()})
+            elif stall >= 4:
+                return self._force_answer()
+            failed = failed or not progress  # re-enable thinking to get out of the rut
         self.emit("notice", text=f"reached the step limit ({self.cfg.max_steps}); stopping")
         return last_text
+
+    def _stall_note(self) -> str:
+        seen_imgs = []
+        for m in self.messages:
+            c = m.get("content")
+            if isinstance(c, list):
+                seen_imgs += [p["text"][8:-1] for p, q in zip(c, c[1:])
+                              if p.get("text", "").startswith("[image: ") and q.get("type") == "image_url"]
+        imgs = f" Images you can already see: {', '.join(seen_imgs)}." if seen_imgs else ""
+        return ("[harness] Your last steps only repeated things you already have." + imgs +
+                " Stop re-checking. Decide now with what you have and act on it (e.g. download / set_wallpaper),"
+                " or answer the user.")
+
+    def _force_answer(self) -> str:
+        self.emit("notice", text="stopped a loop: asking the model for its decision without further tools")
+        self.messages.append({"role": "user", "content": (
+            "[harness] You are stuck in a loop, so tools are disabled for this reply. Using only what you have "
+            "already seen, give your decision and answer now. If you were choosing between images, say which one "
+            "and why; the user can tell you to go ahead.")})
+        self.emit("step", step=-1, think=False)
+        t0 = time.time()
+        try:
+            res = self.llm.chat(self.messages, self.tool_schemas, thinking=False, tool_choice="none",
+                                temperature=self.mode.temperature, top_p=self.mode.top_p,
+                                on_content=lambda c: self.emit("content", text=c))
+        except Cancelled:
+            return self._cancelled("")
+        self._account(res, time.time() - t0, False)
+        content = re.sub(r"(?s)<tool_call>.*?(</tool_call>|$)", "", res.content).strip()
+        self.messages.append({"role": "assistant", "content": content or "(no answer)"})
+        return content
 
     def _cancelled(self, last_text: str) -> str:
         self.emit("cancelled")
@@ -225,7 +268,8 @@ class Agent:
             return step == 0
         return step == 0 or failed  # adaptive
 
-    def _run_tools(self, res: Completion, seen: dict) -> bool:
+    def _run_tools(self, res: Completion, seen: dict) -> tuple[bool, bool]:
+        """Run the calls. Returns (any_failed, made_progress)."""
         parsed = []
         for tc in res.tool_calls:
             name = tc["function"]["name"]
@@ -242,22 +286,25 @@ class Agent:
             tc, name, args, err = item
             t0 = time.time()
             self.emit("tool_start", id=tc["id"], name=name, args=args)
+            redundant = False
             if err:
                 out, is_err = err, True
             elif self._stop.is_set():
                 out, is_err = "Error: cancelled by the user before it ran.", True
             elif name == "view_image" and image_in_context(self.messages, label := self.tb.image_label(str(args.get("path", "")))):
-                out, is_err = (f"[image: {label}] is still visible above in this conversation; look at it there "
-                               "instead of viewing it again."), False
+                out, is_err, redundant = (f"[image: {label}] is still visible above in this conversation; look at it "
+                                          "there instead of viewing it again."), False, True
             else:
                 sig = (name, json.dumps(args, sort_keys=True))
                 seen[sig] = seen.get(sig, 0) + 1
+                tool = self.tb.tools.get(name)
+                redundant = seen[sig] >= 2 and bool(tool and tool.read_only) or name == "contact_sheet" and seen[sig] >= 2
                 if seen[sig] >= 3 and name not in ("bash", "view_image"):
                     out, is_err = "Error: you've made this exact call 3 times. It won't change. Try something different.", True
                 else:
                     out, is_err = self.tb.run(name, args)
             self.emit("tool_end", id=tc["id"], name=name, args=args, output=out, error=is_err, dt=time.time() - t0)
-            return out, is_err
+            return out, is_err, redundant
 
         read_only = all(self.tb.tools.get(n) and self.tb.tools[n].read_only for _, n, _, _ in parsed)
         if len(parsed) > 1 and read_only:
@@ -267,7 +314,8 @@ class Agent:
             results = [one(p) for p in parsed]
 
         any_failed = False
-        for (tc, name, _, _), (out, is_err) in zip(parsed, results):
+        progress = not all(r[2] for r in results)
+        for (tc, name, _, _), (out, is_err, _) in zip(parsed, results):
             any_failed |= is_err
             self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out, "_err": is_err})
 
@@ -276,7 +324,7 @@ class Agent:
                 {"type": "text", "text": "(images from view_image)"}, *self.tb.pending_images]})
             self.tb.pending_images.clear()
             drop_old_images(self.messages, self.cfg.max_images_in_context)
-        return any_failed
+        return any_failed, progress
 
     def _account(self, res: Completion, dt: float, think: bool) -> None:
         s = self.stats

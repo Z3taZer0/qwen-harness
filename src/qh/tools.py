@@ -47,6 +47,7 @@ def _obj(props: dict, required: list[str]) -> dict:
 
 
 S, I = {"type": "string"}, {"type": "integer"}
+A = {"type": "array", "items": S}
 
 # Commands that need an explicit yes when cfg.confirm_dangerous is on. Edit to taste.
 DANGEROUS = [
@@ -247,6 +248,30 @@ class Toolbox:
         self.pending_images += [{"type": "text", "text": f"[image: {label}]"}, part]
         return f"Image attached below as [image: {label}] ({note.split(' (', 1)[-1].rstrip(')')})"
 
+    def contact_sheet(self, paths: list[str]) -> str:
+        """Compare many images at once: one numbered grid image instead of N separate views."""
+        import tempfile
+        from .vision import contact_sheet, load_image_part
+
+        if isinstance(paths, str):
+            paths = [p for p in re.split(r"[\n,]+", paths) if p.strip()]
+        if not 2 <= len(paths) <= 12:
+            return "Error: give 2-12 image paths (use view_image for a single image)."
+        local = []
+        for p in paths:
+            p = p.strip()
+            local.append(web.fetch_to_temp(p) if p.startswith(("http://", "https://")) else str(self.path(p)))
+        missing = [p for p in local if not Path(p).is_file()]
+        if missing:
+            return f"Error: not files: {', '.join(missing)}"
+        out = str(Path(tempfile.mkdtemp(prefix="qh_sheet_")) / "contact_sheet.jpg")
+        labels = contact_sheet(local, out)
+        part, _ = load_image_part(out, self.cfg, max_pixels=self.cfg.contact_sheet_pixels)
+        label = f"contact sheet: {'; '.join(labels)}"
+        self.pending_images += [{"type": "text", "text": f"[image: {label}]"}, part]
+        return (f"Contact sheet {out} attached below. Tiles: "
+                + "; ".join(f"{l} = {p}" for l, p in zip(labels, local)))
+
     def inspect_image(self, path: str) -> str:
         """Inspect image dimensions, format, and aspect ratio without loading it as visual tokens."""
         p = self.path(path)
@@ -317,6 +342,9 @@ class Toolbox:
                  _obj({"path": S}, ["path"]), self.inspect_image, True),
             Tool("view_image", "Look at an image (local path or http URL; prefer small thumbnail URLs). Shown to you in the next message.",
                  _obj({"path": S}, ["path"]), self.view_image),
+            Tool("contact_sheet", "Compare 2-12 images (paths or URLs) in ONE numbered grid image. Use this instead of "
+                 "several view_image calls when choosing between candidates.",
+                 _obj({"paths": A}, ["paths"]), self.contact_sheet),
             Tool("set_wallpaper", "Apply an image (local path, e.g. just downloaded) as the desktop wallpaper. "
                  "Copies it into the user's wallpaper folder first.",
                  _obj({"path": S}, ["path"]), self.set_wallpaper),

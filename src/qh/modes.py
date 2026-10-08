@@ -80,7 +80,8 @@ MODES: dict[str, ReasoningMode] = {
 - Text that belongs to the artwork is fine: a character's name, a title logo, stylized typography or
   small credits that are part of the composition. Don't discard an image just because it contains text;
   judge whether the text is part of the design or an overlay added on top of it.
-- Compare candidate choices side-by-side against the user's stylistic tastes before committing.""",
+- Compare candidates side-by-side in ONE contact_sheet against the user's stylistic tastes, then commit
+  to a choice. One comparison pass is enough; don't re-inspect images you already judged.""",
         temperature=0.7,
         top_p=0.95,
     ),

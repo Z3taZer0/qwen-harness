@@ -11,13 +11,14 @@ from PIL import Image, ImageOps
 from .config import Config
 
 
-def load_image_part(path: str, cfg: Config) -> tuple[dict, str]:
+def load_image_part(path: str, cfg: Config, max_pixels: int | None = None) -> tuple[dict, str]:
     img = ImageOps.exif_transpose(Image.open(path))
     w, h = img.size
     px = w * h
     scale = 1.0
-    if px > cfg.image_max_pixels:
-        scale = math.sqrt(cfg.image_max_pixels / px)
+    limit = max_pixels or cfg.image_max_pixels
+    if px > limit:
+        scale = math.sqrt(limit / px)
     elif px < cfg.image_min_pixels:
         scale = math.sqrt(cfg.image_min_pixels / px)
     if scale != 1.0:
@@ -78,3 +79,36 @@ def image_in_context(messages: list[dict], label: str) -> bool:
                 if a.get("text") == tag and b.get("type") == "image_url":
                     return True
     return False
+
+
+def contact_sheet(paths: list[str], out: str, cols: int = 0, tile_w: int = 480) -> list[str]:
+    """Grid of numbered thumbnails (one image instead of N). Returns the labels drawn."""
+    from PIL import ImageDraw, ImageFont
+
+    cols = cols or (2 if len(paths) <= 4 else 3)
+    tile_h = tile_w * 9 // 16
+    rows = math.ceil(len(paths) / cols)
+    pad, bar = 6, 26
+    sheet = Image.new("RGB", (cols * (tile_w + pad) + pad, rows * (tile_h + bar + pad) + pad), (24, 24, 28))
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.load_default(size=18)
+    except TypeError:  # Pillow < 10.1
+        font = ImageFont.load_default()
+    labels = []
+    for i, p in enumerate(paths):
+        x = pad + (i % cols) * (tile_w + pad)
+        y = pad + (i // cols) * (tile_h + bar + pad)
+        try:
+            im = ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+            dims = f"{im.size[0]}x{im.size[1]}"
+            im = ImageOps.contain(im, (tile_w, tile_h), Image.BILINEAR)
+            sheet.paste(im, (x + (tile_w - im.size[0]) // 2, y + bar + (tile_h - im.size[1]) // 2))
+        except Exception as e:
+            dims = f"unreadable: {type(e).__name__}"
+        name = p.rsplit("/", 1)[-1]
+        label = f"{i + 1}. {name} ({dims})"
+        draw.text((x + 4, y + 3), label if len(label) < 48 else label[:46] + "…", fill=(235, 235, 235), font=font)
+        labels.append(label)
+    sheet.save(out, "JPEG", quality=85)
+    return labels
