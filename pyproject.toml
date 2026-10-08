@@ -1,0 +1,21 @@
+[project]
+name = "qh"
+version = "0.1.0"
+description = "Lean agentic harness tuned for Qwen3.x 27B on a local vLLM server"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "pillow>=10",
+    "pygobject>=3.46"
+]
+
+[project.scripts]
+qh = "qh.cli:main"
+qh-gui = "qh.gui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qh"]

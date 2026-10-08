@@ -1,0 +1,219 @@
+"""Small, fixed tool set. Schemas are static and terse so the cached prefix never changes
+and costs only a few hundred tokens (vs ~10k+ for general-purpose harnesses)."""
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from .config import Config
+from . import knowledge, web
+
+
+def clip(text: str, limit: int) -> str:
+    """Head+tail truncation: errors and summaries usually live at the end."""
+    if len(text) <= limit:
+        return text
+    h, t = int(limit * 0.4), int(limit * 0.6)
+    return f"{text[:h]}\n... [{len(text) - h - t} chars truncated] ...\n{text[-t:]}"
+
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    parameters: dict
+    fn: Callable[..., str]
+    read_only: bool = False
+
+    def schema(self) -> dict:
+        return {
+            "type": "function",
+            "function": {"name": self.name, "description": self.description, "parameters": self.parameters},
+        }
+
+
+def _obj(props: dict, required: list[str]) -> dict:
+    return {"type": "object", "properties": props, "required": required}
+
+
+S, I = {"type": "string"}, {"type": "integer"}
+
+
+class Toolbox:
+    def __init__(self, cfg: Config, cwd: str):
+        self.cfg = cfg
+        self.cwd = Path(cwd).resolve()
+        self.pending_images: list[dict] = []  # image parts to inject after tool results
+        self.read_files: set[str] = set()
+        self.skills = knowledge.discover_skills()
+        self.ask = None  # set by the agent: callable(str)->bool for user approval
+        self.tools: dict[str, Tool] = {t.name: t for t in self._build()}
+
+    # ---------------------------------------------------------------- helpers
+    def path(self, p: str) -> Path:
+        q = Path(os.path.expanduser(p))
+        return q if q.is_absolute() else self.cwd / q
+
+    def schemas(self) -> list[dict]:
+        return [t.schema() for t in self.tools.values()]
+
+    def run(self, name: str, args: dict) -> tuple[str, bool]:
+        """Returns (output, is_error)."""
+        tool = self.tools.get(name)
+        if not tool:
+            return f"Unknown tool '{name}'. Available: {', '.join(self.tools)}", True
+        try:
+            out = tool.fn(**args)
+            limit = 24_000 if name == "load_skill" else self.cfg.max_tool_chars
+            return clip(out, limit), out.startswith("Error")
+        except TypeError as e:
+            return f"Error: bad arguments for {name}: {e}", True
+        except Exception as e:  # tool bugs must never kill the loop
+            return f"Error: {type(e).__name__}: {e}", True
+
+    # ------------------------------------------------------------------ tools
+    def bash(self, command: str, timeout: int | None = None) -> str:
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=self.cwd, capture_output=True, text=True,
+                timeout=timeout or self.cfg.bash_timeout, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as e:
+            partial = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+            return f"Error: timed out after {timeout or self.cfg.bash_timeout}s\n{clip(partial, 3000)}"
+        out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
+        return f"{out.strip() or '(no output)'}\n[exit {r.returncode}]"
+
+    def read_file(self, path: str, start: int = 1, end: int = 400) -> str:
+        p = self.path(path)
+        if not p.is_file():
+            return f"Error: not a file: {p}"
+        lines = p.read_text(errors="replace").splitlines()
+        self.read_files.add(str(p))
+        s, e = max(1, start), min(len(lines), end)
+        body = "\n".join(f"{i + 1}\t{lines[i]}" for i in range(s - 1, e))
+        more = f"\n[showing {s}-{e} of {len(lines)} lines]" if e < len(lines) or s > 1 else ""
+        return body + more
+
+    def write_file(self, path: str, content: str) -> str:
+        p = self.path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        self.read_files.add(str(p))
+        return f"Wrote {len(content)} chars to {p}"
+
+    def edit_file(self, path: str, old: str, new: str, replace_all: bool = False) -> str:
+        p = self.path(path)
+        if not p.is_file():
+            return f"Error: not a file: {p}"
+        text = p.read_text()
+        n = text.count(old)
+        if n == 0:
+            return "Error: `old` not found. Use read_file to copy the exact text (whitespace matters)."
+        if n > 1 and not replace_all:
+            return f"Error: `old` matches {n} places. Add surrounding context or set replace_all."
+        p.write_text(text.replace(old, new) if replace_all else text.replace(old, new, 1))
+        return f"Edited {p} ({n if replace_all else 1} replacement)"
+
+    def grep(self, pattern: str, path: str = ".", glob: str = "") -> str:
+        rg = shutil.which("rg")
+        if rg:
+            cmd = [rg, "-n", "--no-heading", "--max-columns", "200", "-m", "50", pattern, str(self.path(path))]
+            if glob:
+                cmd[1:1] = ["-g", glob]
+            r = subprocess.run(cmd, capture_output=True, text=True, cwd=self.cwd)
+            return r.stdout.strip() or "(no matches)"
+        rx, hits = re.compile(pattern), []
+        for f in self._walk(self.path(path)):
+            if glob and not fnmatch.fnmatch(f.name, glob):
+                continue
+            try:
+                for i, line in enumerate(f.read_text(errors="ignore").splitlines(), 1):
+                    if rx.search(line):
+                        hits.append(f"{f}:{i}:{line[:200]}")
+                        if len(hits) >= 50:
+                            return "\n".join(hits)
+            except OSError:
+                pass
+        return "\n".join(hits) or "(no matches)"
+
+    def find_files(self, pattern: str, path: str = ".") -> str:
+        res = [str(f.relative_to(self.cwd)) if f.is_relative_to(self.cwd) else str(f)
+               for f in self._walk(self.path(path)) if fnmatch.fnmatch(f.name, pattern) or fnmatch.fnmatch(str(f), pattern)]
+        return "\n".join(res[:200]) or "(no files)"
+
+    @staticmethod
+    def _walk(root: Path):
+        skip = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
+        if root.is_file():
+            yield root
+            return
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d not in skip]
+            for fn in fns:
+                yield Path(dp) / fn
+
+    def view_image(self, path: str) -> str:
+        from .vision import load_image_part
+
+        if path.startswith(("http://", "https://")):
+            path = web.fetch_to_temp(path)
+        p = self.path(path)
+        if not p.is_file():
+            return f"Error: not a file: {p}"
+        part, note = load_image_part(str(p), self.cfg)
+        self.pending_images.append(part)
+        return f"Image attached below: {note}"
+
+    def inspect_image(self, path: str) -> str:
+        """Inspect image dimensions, format, and aspect ratio without loading it as visual tokens."""
+        p = self.path(path)
+        if not p.is_file():
+            return f"Error: not a file: {p}"
+        try:
+            from PIL import Image
+            with Image.open(p) as img:
+                w, h = img.size
+                ratio = w / h if h else 0
+                return f"{p.name}: {img.format} {w}x{h} (ratio {ratio:.2f}, {'16:9' if abs(ratio - 16/9) < 0.05 else 'not 16:9'})"
+        except Exception as e:
+            return f"Error reading image: {e}"
+
+    # ------------------------------------------------------------- definitions
+    def _build(self) -> list[Tool]:
+        return [
+            Tool("bash", "Run a shell command in the project dir. Returns stdout/stderr and exit code.",
+                 _obj({"command": S, "timeout": I}, ["command"]), self.bash),
+            Tool("read_file", "Read a text file with line numbers. Default lines 1-400; use start/end for more.",
+                 _obj({"path": S, "start": I, "end": I}, ["path"]), self.read_file, True),
+            Tool("write_file", "Create or overwrite a file with the full content.",
+                 _obj({"path": S, "content": S}, ["path", "content"]), self.write_file),
+            Tool("edit_file", "Replace exact text `old` with `new` in a file. Prefer this over write_file for changes.",
+                 _obj({"path": S, "old": S, "new": S, "replace_all": {"type": "boolean"}}, ["path", "old", "new"]), self.edit_file),
+            Tool("grep", "Regex search file contents (max 50 hits). Optional glob like '*.py'.",
+                 _obj({"pattern": S, "path": S, "glob": S}, ["pattern"]), self.grep, True),
+            Tool("find_files", "Find files by name glob, e.g. '*.py'.",
+                 _obj({"pattern": S, "path": S}, ["pattern"]), self.find_files, True),
+            Tool("load_skill", "Load a skill playbook by name (see the skill list in the system prompt).",
+                 _obj({"name": S}, ["name"]), lambda name: knowledge.load_skill(self.skills, name), True),
+            Tool("propose_note", "Propose a durable lesson/fact worth remembering for future sessions (user approves). Use sparingly, only for non-obvious, reusable facts.",
+                 _obj({"note": S}, ["note"]), lambda note: knowledge.propose_note(note, self.ask)),
+            Tool("web_search", "Search the web. Returns title, URL, snippet for ~8 results.",
+                 _obj({"query": S}, ["query"]), lambda query: web.web_search(query), True),
+            Tool("fetch_url", "GET a URL and return text (HTML is stripped; JSON as-is). For APIs and pages.",
+                 _obj({"url": S, "max_chars": I}, ["url"]), lambda url, max_chars=8000: web.fetch_url(url, max_chars), True),
+            Tool("download", "Download a URL to a local path. Reports size and image resolution.",
+                 _obj({"url": S, "path": S}, ["url", "path"]), lambda url, path: web.download(url, str(self.path(path)))),
+            Tool("inspect_image", "Fast image metadata check (dimensions, format, aspect ratio) without spending visual tokens. Also aliased as 'identify'.",
+                 _obj({"path": S}, ["path"]), self.inspect_image, True),
+            Tool("identify", "Alias for inspect_image: get image dimensions and format quickly.",
+                 _obj({"path": S}, ["path"]), self.inspect_image, True),
+            Tool("view_image", "Look at an image (local path or http URL; prefer small thumbnail URLs). Shown to you in the next message.",
+                 _obj({"path": S}, ["path"]), self.view_image),
+        ]
