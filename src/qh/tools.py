@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -59,6 +60,28 @@ DANGEROUS = [
     (r"\b(chmod|chown)\s+-R\s+\S+\s+/(\s|$)", "recursive permission change on /"),
     (r":\(\)\s*\{", "fork bomb"),
 ]
+
+
+def _wallpaper_setters() -> list[str]:
+    """Known Wayland/X11 wallpaper setters that are installed, best first."""
+    has = shutil.which
+    out = []
+    if has("swww"):
+        out.append("swww img {path} --transition-type fade --transition-duration 1")
+    if has("awww"):
+        out.append("awww img {path}")
+    if has("hyprctl") and subprocess.run("pgrep -x hyprpaper", shell=True, capture_output=True).returncode == 0:
+        out.append("hyprctl hyprpaper reload ,{path}")
+    if has("swaybg"):
+        out.append("pkill -x swaybg; (setsid swaybg -m fill -i {path} >/dev/null 2>&1 &)")
+    if has("plasma-apply-wallpaperimage"):
+        out.append("plasma-apply-wallpaperimage {path}")
+    if has("gsettings") and os.environ.get("XDG_CURRENT_DESKTOP", "").lower().find("gnome") >= 0:
+        out.append("gsettings set org.gnome.desktop.background picture-uri-dark file://{path} && "
+                   "gsettings set org.gnome.desktop.background picture-uri file://{path}")
+    if has("feh") and os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        out.append("feh --bg-fill {path}")
+    return out
 
 
 def danger(command: str) -> str | None:
@@ -231,6 +254,31 @@ class Toolbox:
         except Exception as e:
             return f"Error reading image: {e}"
 
+    def set_wallpaper(self, path: str) -> str:
+        """Copy the image into the wallpaper folder (if it isn't there yet) and apply it."""
+        src = self.path(path)
+        if not src.is_file():
+            return f"Error: not a file: {src}"
+        wdir = Path(os.path.expanduser(self.cfg.wallpaper_dir))
+        wdir.mkdir(parents=True, exist_ok=True)
+        dest = src if src.resolve().parent == wdir.resolve() else wdir / src.name
+        if dest != src:
+            if dest.exists() and dest.read_bytes() != src.read_bytes():
+                dest = wdir / f"{src.stem}-{int(time.time())}{src.suffix}"
+            shutil.copy2(src, dest)
+        cmds = [self.cfg.wallpaper_cmd] if self.cfg.wallpaper_cmd else _wallpaper_setters()
+        if not cmds:
+            return (f"Error: saved to {dest}, but no wallpaper setter was found. Find how this desktop sets "
+                    f"wallpapers (its config/CLI), then set QH_WALLPAPER_CMD (e.g. 'tool {{path}}') via propose_note.")
+        errors = []
+        for tpl in cmds:
+            cmd = tpl.replace("{path}", shlex.quote(str(dest)))
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=self.cwd)
+            if r.returncode == 0:
+                return f"Wallpaper set: {dest} (via: {cmd})"
+            errors.append(f"{cmd} -> exit {r.returncode}: {(r.stderr or r.stdout).strip()[:300]}")
+        return f"Error: saved to {dest}, but setting it failed:\n" + "\n".join(errors)
+
     # ------------------------------------------------------------- definitions
     def _build(self) -> list[Tool]:
         return [
@@ -262,4 +310,7 @@ class Toolbox:
                  _obj({"path": S}, ["path"]), self.inspect_image, True),
             Tool("view_image", "Look at an image (local path or http URL; prefer small thumbnail URLs). Shown to you in the next message.",
                  _obj({"path": S}, ["path"]), self.view_image),
+            Tool("set_wallpaper", "Apply an image (local path, e.g. just downloaded) as the desktop wallpaper. "
+                 "Copies it into the user's wallpaper folder first.",
+                 _obj({"path": S}, ["path"]), self.set_wallpaper),
         ]

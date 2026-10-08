@@ -23,11 +23,12 @@ part of how it reasons is a plain file you can edit.
 - **Cache-aligned prompts.** Switching mode or working directory mid-chat never rewrites the
   system prompt. The change rides on your next message, so the prefix cache survives.
 - **Reasoning modes:** `auto` (adaptive), `complex`, `artistic`, `quick`, plus your own (see below).
-- **Safety net for destructive commands.** `rm -rf`, `sudo`, `dd`, `mkfs`, `git push --force`… ask
-  for approval first. You can turn this off.
+- **Optional safety net.** With `QH_CONFIRM_DANGEROUS=true`, `rm -rf`, `sudo`, `dd`, `mkfs`,
+  `git push --force`… ask for approval first. It's off by default, so everything runs without asking.
+- **One-call wallpapers.** `set_wallpaper` files the image into your wallpaper folder and applies it.
 - **Fast vision pipeline:** bounded-pixel JPEG downscaling, with old images evicted to protect the cache.
 - **Tools:** shell, read/write/edit file, grep/find, web search, fetch, download, image
-  inspect/view, skill loader, memory notes.
+  inspect/view, set wallpaper, skill loader, memory notes.
 
 ## Install
 
@@ -97,7 +98,9 @@ lines, `QH_` prefix optional). The GUI preferences dialog writes that file for y
 | `QH_CONTEXT_WINDOW` | `126976` | Must match vLLM `--max-model-len` |
 | `QH_MAX_STEPS` | `0` | Model calls per message (`0` = unlimited) |
 | `QH_MAX_TOKENS` | `8192` | Output tokens per call |
-| `QH_CONFIRM_DANGEROUS` | `true` | Ask before destructive shell commands |
+| `QH_CONFIRM_DANGEROUS` | `false` | Ask before destructive shell commands |
+| `QH_WALLPAPER_DIR` | `~/Pictures/Wallpapers` | Where `set_wallpaper` files images |
+| `QH_WALLPAPER_CMD` | *(auto-detect)* | Command that applies a wallpaper; `{path}` is replaced by the image path. Empty = try swww, hyprpaper, swaybg, plasma, gnome, feh |
 | `QH_SHOW_REASONING` | `true` | Stream thoughts (CLI) / expand them while thinking (GUI) |
 | `QH_SAVE_SESSIONS` | `true` | Persist conversations |
 | `QH_BASH_TIMEOUT` | `120` | Seconds before a shell command is killed |

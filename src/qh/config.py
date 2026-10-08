@@ -42,7 +42,11 @@ class Config:
 
     # --- tools / safety -----------------------------------------------------
     bash_timeout: int = 120
-    confirm_dangerous: bool = True     # ask before rm -rf, sudo, dd, mkfs, shutdown, ...
+    confirm_dangerous: bool = False    # ask before rm -rf, sudo, dd, mkfs, shutdown, ...
+
+    # --- desktop ------------------------------------------------------------
+    wallpaper_dir: str = "~/Pictures/Wallpapers"
+    wallpaper_cmd: str = ""            # e.g. "serpantinum wallpaper {path}"; empty = auto-detect
 
     # --- interface ----------------------------------------------------------
     show_reasoning: bool = True        # stream the model's thoughts (CLI: dim text, GUI: expander)

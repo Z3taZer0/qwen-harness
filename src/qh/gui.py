@@ -139,7 +139,7 @@ TOOL_ICONS = {
     "web_search": "web-browser-symbolic", "fetch_url": "network-transmit-receive-symbolic",
     "download": "folder-download-symbolic", "view_image": "image-x-generic-symbolic",
     "inspect_image": "image-x-generic-symbolic", "identify": "image-x-generic-symbolic",
-    "load_skill": "accessories-dictionary-symbolic", "propose_note": "starred-symbolic",
+    "load_skill": "accessories-dictionary-symbolic", "set_wallpaper": "preferences-desktop-wallpaper-symbolic", "propose_note": "starred-symbolic",
 }
 
 
@@ -343,6 +343,21 @@ class ToolCard(Gtk.Box):
         out = output if len(output) <= 8000 else output[:8000] + f"\n… [{len(output) - 8000} more chars]"
         self.detail.append(Gtk.Separator())
         self.detail.append(label(out.strip() or "(no output)", ("qh-tool-out",) + (("error",) if error else ()), select=True))
+        img = self._image_result(output, error)
+        if img:  # downloads / wallpapers / viewed images: show what the agent actually got
+            pic = thumb(img, 160)
+            pic.set_halign(Gtk.Align.START)
+            pic.set_size_request(284, 160)
+            self.append(pic)
+            pic.set_margin_top(6)
+
+    def _image_result(self, output: str, error: bool) -> str | None:
+        if error or self.name not in ("download", "set_wallpaper", "view_image", "inspect_image", "identify"):
+            return None
+        m = re.search(r"(?:Saved|Wallpaper set:) (\S+)", output)
+        p = m.group(1) if m else self.args.get("path", "")
+        p = os.path.expanduser(p) if isinstance(p, str) else ""
+        return p if p and Path(p).suffix.lower() in IMAGE_EXT and Path(p).is_file() else None
 
 
 class UserBubble(Gtk.Box):
@@ -1297,6 +1312,13 @@ class QHWindow(Adw.ApplicationWindow):
             g.add(r)
         page.add(g)
 
+        g = Adw.PreferencesGroup(title="Desktop")
+        wdir = Adw.EntryRow(title="Wallpaper folder", text=c.wallpaper_dir)
+        wcmd = Adw.EntryRow(title="Wallpaper command ({path} = image; empty = auto-detect)", text=c.wallpaper_cmd)
+        for r in (wdir, wcmd):
+            g.add(r)
+        page.add(g)
+
         g = Adw.PreferencesGroup(title="Customization", description="Plain files, picked up on the next new chat")
         for title, sub, path, touch in (
             ("System prompt", "system.md replaces the built-in prompt", CONFIG_DIR / "system.md", True),
@@ -1317,9 +1339,10 @@ class QHWindow(Adw.ApplicationWindow):
             c.max_steps, c.thinking = int(steps.get_value()), think_opts[think.get_selected()]
             c.show_reasoning, c.confirm_dangerous = reason.get_active(), danger.get_active()
             c.save_sessions = save.get_active()
+            c.wallpaper_dir, c.wallpaper_cmd = wdir.get_text().strip() or c.wallpaper_dir, wcmd.get_text().strip()
             try:
                 c.save(["base_url", "model", "api_key", "context_window", "max_tokens", "max_steps", "thinking",
-                        "show_reasoning", "confirm_dangerous", "save_sessions"])
+                        "show_reasoning", "confirm_dangerous", "save_sessions", "wallpaper_dir", "wallpaper_cmd"])
             except OSError as e:
                 self.toast(f"Could not save config: {e}")
             if not self.busy:

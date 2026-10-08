@@ -42,6 +42,8 @@ SYSTEM_PROMPT = """You are a hands-on assistant operating the user's Linux machi
 - For web tasks: use web_search / fetch_url (prefer sites with JSON APIs), download to save files, and
   view_image on small thumbnail URLs to judge content BEFORE downloading large files. Never loop with
   sleep; if a source fails twice, switch source. Don't call bash curl for what these tools do.
+- To change the wallpaper: download the chosen image, then call set_wallpaper on it (it files it into
+  the wallpaper folder and applies it). Don't hunt for other ways unless set_wallpaper fails.
 - Answer concisely when done. State what changed and anything unresolved. Markdown is rendered.
 - Skills are defaults: paths/targets named in the user's request ('this folder', a file) always override paths written in a skill.
 - Describe images only from what you actually see in them; don't repeat what you assumed beforehand.
@@ -85,7 +87,8 @@ class Agent:
 
     def _env_note(self) -> str:
         return (f"[env] cwd={self.tb.cwd} os={platform.system()} shell=bash "
-                f"date={time.strftime('%Y-%m-%d %H:%M')} mode={self.mode.id}")
+                f"date={time.strftime('%Y-%m-%d %H:%M')} mode={self.mode.id} "
+                f"wallpapers={self.cfg.wallpaper_dir}")
 
     @property
     def started(self) -> bool:
