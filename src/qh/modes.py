@@ -75,7 +75,11 @@ MODES: dict[str, ReasoningMode] = {
         system_guidance="""Reasoning Pattern (Aesthetic & Visual Judgement):
 - When evaluating visual assets (wallpapers, artwork, designs), avoid rigid mechanical parsing.
 - Evaluate composition, visual harmony, lighting, color palettes (warm vs cold, contrast), mood, and atmospheric emotion.
-- Prioritize cleanliness: verify absence of watermarks, artifacts, distracting text/subtitles, or compression noise.
+- Prioritize cleanliness: reject watermarks, site/uploader logos, signatures stamped over the art, subtitles,
+  UI/screenshot overlays, artifacts and compression noise.
+- Text that belongs to the artwork is fine: a character's name, a title logo, stylized typography or
+  small credits that are part of the composition. Don't discard an image just because it contains text;
+  judge whether the text is part of the design or an overlay added on top of it.
 - Compare candidate choices side-by-side against the user's stylistic tastes before committing.""",
         temperature=0.7,
         top_p=0.95,

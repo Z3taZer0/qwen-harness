@@ -206,10 +206,9 @@ class MarkdownView(Gtk.Box):
         elif blk.kind == "code":
             w = CodeBlock(blk)
         elif blk.kind == "table":
-            lb = label(blk.body, ("qh-table",), wrap=False, select=True)
-            sw = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True)
-            sw.set_child(lb)
-            w = sw
+            # No nested ScrolledWindow: those swallow wheel/touchpad scrolling of the chat.
+            lb = label(blk.body, ("qh-table",), select=True)
+            w = lb
             w._update = lambda b: lb.set_text(b.body)
         else:
             lb = label(blk.body, select=True, markup=True)
@@ -235,10 +234,11 @@ class CodeBlock(Gtk.Box):
                                           GLib.timeout_add(1200, lambda: b.set_icon_name("edit-copy-symbolic"))))
         hdr.append(btn)
         self.append(hdr)
-        self.body = label("", ("qh-code-body",), wrap=False, select=True)
-        sw = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True)
-        sw.set_child(self.body)
-        self.append(sw)
+        # Long lines wrap instead of scrolling sideways: a nested ScrolledWindow would
+        # swallow wheel/touchpad scrolling whenever the pointer is over a code block.
+        self.body = label("", ("qh-code-body",), select=True)
+        self.body.set_wrap_mode(Pango.WrapMode.CHAR)
+        self.append(self.body)
         self._kind = "code"
         self._update(blk)
 
@@ -625,10 +625,18 @@ class QHWindow(Adw.ApplicationWindow):
         self.stack.add_named(clamp, "chat")
         self.scroller.set_child(self.stack)
         overlay.set_child(self.scroller)
+        # Auto-follow: stick to the bottom while new output arrives, until the user scrolls
+        # up; scrolling back down to the end (or the ↓ button, or sending) re-attaches.
         self.sticky = True
+        self._autoscroll = False
         adj = self.scroller.get_vadjustment()
         adj.connect("value-changed", self._on_scroll)
-        adj.connect("notify::upper", self._on_grow)
+        adj.connect("notify::upper", self._follow)
+        adj.connect("notify::page-size", self._follow)
+        wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        wheel.connect("scroll", self._on_wheel)
+        self.scroller.add_controller(wheel)
         self.fab = Gtk.Button(icon_name="go-down-symbolic", tooltip_text="Scroll to bottom",
                               halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=12, visible=False)
         self.fab.add_css_class("osd")
@@ -794,20 +802,33 @@ class QHWindow(Adw.ApplicationWindow):
             self.send.add_css_class("suggested-action")
             self.send.set_sensitive(bool(text.strip() or self.attached))
 
-    def _on_scroll(self, adj):
-        at_bottom = adj.get_value() >= adj.get_upper() - adj.get_page_size() - 40
-        self.sticky = at_bottom
-        self.fab.set_visible(not at_bottom)
+    @staticmethod
+    def _at_bottom(adj) -> bool:
+        return adj.get_value() >= adj.get_upper() - adj.get_page_size() - 4
 
-    def _on_grow(self, adj, _p):
-        if self.sticky:
+    def _on_wheel(self, _ctl, _dx, dy):
+        if dy < 0:  # any upward scroll, however small, detaches from the bottom
+            self.sticky = False
+            self.fab.set_visible(True)
+        return False  # let the ScrolledWindow scroll as usual
+
+    def _on_scroll(self, adj):
+        at_bottom = self._at_bottom(adj)
+        if not self._autoscroll:  # user moved it (wheel, scrollbar, keys, kinetic)
+            self.sticky = at_bottom
+        self.fab.set_visible(not at_bottom and not self.sticky)
+
+    def _follow(self, adj, _p=None):
+        if self.sticky and not self._at_bottom(adj):
+            self._autoscroll = True
             adj.set_value(adj.get_upper() - adj.get_page_size())
+            self._autoscroll = False
 
     def scroll_bottom(self, force: bool = False):
         if force:
             self.sticky = True
-        adj = self.scroller.get_vadjustment()
-        GLib.idle_add(lambda: adj.set_value(adj.get_upper() - adj.get_page_size()))
+            self.fab.set_visible(False)
+        GLib.idle_add(self._follow, self.scroller.get_vadjustment())
 
     def add_row(self, w: Gtk.Widget) -> None:
         self.chat.append(w)
@@ -1057,6 +1078,8 @@ class QHWindow(Adw.ApplicationWindow):
             self.attached.clear()
             self._render_attachments()
         text = text or "Describe this image."
+        if not self.agent.title:
+            self.wtitle.set_title(sessions.title_from(text))
         self.add_row(UserBubble(text, images or []))
         self.msg = AssistantMessage(self)
         self.add_row(self.msg)
